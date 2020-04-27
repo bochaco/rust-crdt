@@ -1,6 +1,6 @@
 use super::nodes::{Atom, AtomPayload, Identifier, MiniNodes, SiblingsNodes};
 use crate::ctx::{AddCtx, ReadCtx, RmCtx};
-use crate::traits::{Causal, CmRDT, CvRDT};
+use crate::traits::{CmRDT, CvRDT};
 use crate::vclock::{Actor, VClock};
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
@@ -41,7 +41,7 @@ pub struct LSeq<V: Ord + Clone + Display, A: Actor + Display> {
     /// When inserting, we keep a cache of the strategy for each depth
     strategies: Vec<bool>, // true = boundary+, false = boundary-
     /// Depth 1 siblings nodes
-    pub(crate) siblings: SiblingsNodes<V, A>,
+    siblings: SiblingsNodes<V, A>,
     /// Clock with latest versions of all actors operating on this LSeq
     clock: VClock<A>,
 }
@@ -222,7 +222,7 @@ impl<V: Ord + Clone + Display, A: Actor + Display> LSeq<V, A> {
     }
 
     /// Allocates a new identifier between given p and q identifiers
-    pub(crate) fn alloc_id(
+    fn alloc_id(
         &mut self,
         p: Option<Identifier>,
         q: Option<Identifier>,
@@ -471,9 +471,7 @@ impl<V: Ord + Clone + Display, A: Actor + Display> LSeq<V, A> {
                     cur_depth_nodes = children;
                 }
                 _ => {
-                    // TODO: what if we didn't go through the complete identifier?
-                    // do we have to create more than one new level? it shouldn't ever happen
-                    panic!("Unexpected, it seems we need to create more than one new level?");
+                    panic!("Unexpected, this should never happen, we just added this node above");
                 }
             }
         }
@@ -481,45 +479,8 @@ impl<V: Ord + Clone + Display, A: Actor + Display> LSeq<V, A> {
         cur_depth_nodes
     }
 
-    /// Forget given clock in each of the atoms' clock
-    pub(crate) fn forget_clock(&mut self, clock: &VClock<A>) {
-        // forget it from global clock maintained in the LSeq instance
-        self.clock.forget(clock);
-
-        // now forget it in each atom in the tree
-        LSeq::forget_clock_in_tree(&mut self.siblings, clock);
-    }
-
-    /// Recursivelly forget the given clock in each of the atoms' clock
-    fn forget_clock_in_tree(siblings: &mut SiblingsNodes<V, A>, c: &VClock<A>) {
-        siblings.iter_mut().for_each(|s| match s {
-            (
-                _,
-                Atom::Node {
-                    payload: AtomPayload { ref mut clock, .. },
-                    children: ref mut inner_siblings,
-                },
-            ) => {
-                clock.forget(c);
-                LSeq::forget_clock_in_tree(inner_siblings, c);
-            }
-            (
-                _,
-                Atom::MajorNode {
-                    payload: ref mut mini_nodes,
-                    children: ref mut inner_siblings,
-                },
-            ) => {
-                mini_nodes.iter_mut().for_each(|(_, ref mut atom_value)| {
-                    atom_value.clock.forget(c);
-                });
-                LSeq::forget_clock_in_tree(inner_siblings, c);
-            }
-        });
-    }
-
     /// Find the atom in the tree following the path of the given identifier and delete its value
-    pub(crate) fn delete_id(&mut self, mut id: Identifier, clock: VClock<A>) {
+    fn delete_id(&mut self, mut id: Identifier, clock: VClock<A>) {
         let mut cur_depth_nodes = &mut self.siblings;
         let id_depth = id.len();
         for _ in 0..id_depth - 1 {
