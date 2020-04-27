@@ -12,7 +12,6 @@ use std::{
 const DEFAULT_STRATEGY_BOUNDARY: u8 = 10;
 const DEFAULT_STRATEGY: LSeqStrategy = LSeqStrategy::Alternate;
 const DEFAULT_ROOT_BASE: u64 = 32; // This needs to be greater than boundary, and conveniently needs to be a power of 2
-const BEGIN_ID: u64 = 0;
 
 /// Strategy to be used when allocating a new identifier, which determines if new
 /// id must be created under p or q
@@ -91,6 +90,30 @@ impl<V: Ord + Clone + Display, A: Actor + Display> Display for LSeq<V, A> {
             write!(f, "{}@{}", val, id)?;
         }
         write!(f, "|")
+    }
+}
+
+impl<V: Ord + Clone + Display, A: Actor + Display> CmRDT for LSeq<V, A> {
+    type Op = Op<V, A>;
+
+    fn apply(&mut self, op: Self::Op) {
+        match op {
+            Op::Insert { clock, value, p, q } => {
+                if clock.is_empty() {
+                    return;
+                }
+
+                println!("\n\nINSERTING {} between {:?} and {:?}", value, p, q);
+
+                // Allocate a new identifier between on p and q
+                self.alloc_id(p, q, clock, value);
+            }
+            Op::Delete { id, clock } => {
+                println!("\n\nDELETING {}", id);
+                // Delete value from the atom which corresponds to the given identifier
+                self.delete_id(id, clock);
+            }
+        }
     }
 }
 
@@ -220,15 +243,11 @@ impl<V: Ord + Clone + Display, A: Actor + Display> LSeq<V, A> {
         // Let's make sure we allocate the new number within the preset boundary and interval obtained
         let step = cmp::min(interval, self.boundary as u64);
 
-        // Define if we should apply a boundary+ or boundary- stratey for the
-        // new number, based on the depth where it's being added
-        let depth_strategy = self.gen_strategy(new_id_depth);
-
-        // Depening on the strategy to apply, let's figure which is the new number
-        let new_number = self.gen_new_number(new_id_depth, depth_strategy, step, &p, &q);
+        // Depending on the strategy to apply, let's figure which is the new number
+        let new_number = self.gen_new_number(new_id_depth, step, &p, &q);
 
         // Let's now attempt to insert the new identifier in the tree at new_id_depth
-        let siblings_for_insert = self.find_siblings_in_tree(new_id_depth, &p, &q, depth_strategy);
+        let siblings_for_insert = self.find_siblings_in_tree(new_id_depth, &p);
 
         // We now need to insert the new number in the siblings we just looked up
         println!("New number {} for depth {}", new_number, new_id_depth);
@@ -307,7 +326,7 @@ impl<V: Ord + Clone + Display, A: Actor + Display> LSeq<V, A> {
         }
     }
 
-    // Finds out what's the interval between p and q (reagrdless of their length/height),
+    // Finds out what's the interval between p and q (regardless of their length/height),
     // and figure out which depth (either on p or q path) the new identifier should be generated at
     fn find_new_id_depth(&self, p: &Identifier, q: &Identifier) -> (usize, u64) {
         let mut interval: u64;
@@ -324,14 +343,17 @@ impl<V: Ord + Clone + Display, A: Actor + Display> LSeq<V, A> {
                 "Checking interval at depth {} between {} and {:?}, arity {}...",
                 new_id_depth, p, q, arity
             );
+            if new_id_depth > 4 {
+                panic!("STOP IT!");
+            }
+            let shift = new_id_depth + 2;
 
             // Calculate what would be the position in the sequence of p at current depth
-            let shift = (arity as f64).log2() as u32;
             if new_id_depth < p.len() {
                 let i = p.at(new_id_depth);
                 p_position = (p_position << shift) + i;
             } else {
-                // there is no number for p at this depth, thus we use
+                // There is no number for p at this depth, thus we use
                 // the equivalent of 0 in the range corresponding at this depth
                 p_position = p_position << shift;
             }
@@ -342,15 +364,19 @@ impl<V: Ord + Clone + Display, A: Actor + Display> LSeq<V, A> {
                 prev_q_position = i;
                 q_position = (q_position << shift) + i;
             } else {
-                // there is no number for q at this depth, thus we use the maximum
+                // There is no number for q at this depth, thus we use the maximum
                 // possible for this depth (it should be the same as arity of this depth - 1)
                 q_position = if prev_q_position > 0 {
-                    (q_position << shift) - 1
+                    q_position << shift
                 } else {
-                    (q_position << shift) + arity - 1
+                    (q_position << shift) + arity
                 };
                 prev_q_position = 0;
             }
+
+            println!("POS P: {}", p_position);
+            println!("POS Q: {}", q_position);
+
             // What's the interval between p and q identifiers at current depth?
             interval = if p_position > q_position {
                 // TODO: return error? the trait doesn't support that type of Result currently
@@ -374,35 +400,25 @@ impl<V: Ord + Clone + Display, A: Actor + Display> LSeq<V, A> {
         (new_id_depth, interval)
     }
 
-    /// Get a new number to insert in either p or q path at a
-    /// given depth, and based on the depth's strategy
-    /// TODO: resolve how to handle cases in the edges, e.g. inserting betwen
-    /// last and END, with boundary-, or inserting between BEGIN and first with boundary+
-    fn gen_new_number(
-        &self,
-        depth: usize,
-        strategy: bool,
-        step: u64,
-        p: &Identifier,
-        q: &Identifier,
-    ) -> u64 {
-        // Depening on the strategy to apply, let's figure which is the reference number
+    /// Get a new number to insert at given depth, and based on the depth's strategy
+    fn gen_new_number(&mut self, depth: usize, step: u64, p: &Identifier, q: &Identifier) -> u64 {
+        // Define if we should apply a boundary+ or boundary- stratey for the
+        // new number, based on the depth where it's being added
+        let strategy = self.gen_strategy(depth);
+
+        // Depending on the strategy to apply, let's figure which is the reference number
         // we'll be adding to, or substracting from, to obtain the new number
         if strategy {
-            // We then apply boundary+ strategy from p
-            let reference_num = if depth < p.len() {
-                p.at(depth)
-            } else {
-                BEGIN_ID
-            };
+            // We then apply boundary+ strategy
+            let reference_num = if depth < p.len() { p.at(depth) + 1 } else { 1 };
 
             // TODO: we may need a seed provided by the user to we get a deterministic result
-            //let n = thread_rng().gen_range(reference_num + 1, reference_num + step + 1);
-            let n = reference_num + (step / 2) + 1;
+            //let n = thread_rng().gen_range(reference_num, reference_num + step);
+            let n = reference_num + (step / 2);
             println!("boundary+ (step {}): {}", step, n);
             n
         } else {
-            // ...ok, then apply boundary- strategy from q
+            // ...ok, then apply boundary- strategy
             let reference_num = if depth < q.len() {
                 q.at(depth)
             } else {
@@ -411,44 +427,26 @@ impl<V: Ord + Clone + Display, A: Actor + Display> LSeq<V, A> {
 
             // TODO: we may need a seed provided by the user to we get a deterministic result
             //let n = thread_rng().gen_range(reference_num - step, reference_num);
-            let n = reference_num - (step / 2) - 1;
+            let n = reference_num - (step / 2);
             println!("boundary- (step {}): {}", step, n);
             n
         }
     }
 
     /// Find siblings in the tree at the level/depth where new number shall be inserted
-    fn find_siblings_in_tree(
-        &mut self,
-        depth: usize,
-        p: &Identifier,
-        q: &Identifier,
-        strategy: bool,
-    ) -> &mut SiblingsNodes<V, A> {
+    fn find_siblings_in_tree(&mut self, depth: usize, p: &Identifier) -> &mut SiblingsNodes<V, A> {
         // Let's now attempt to insert the new identifier in the tree at new_id_depth
         let mut cur_depth_nodes = &mut self.siblings;
         for cur_depth in 0..depth {
             // This is not yet the depth where to add the new number,
             // therefore we just check which child is the path of p/q at current's depth
-            let cur_number = if strategy {
-                // if strategy is boundary+ but p is BEGIN at this depth
-                // we then will have to use q path
-                if cur_depth < p.len() {
-                    p.at(cur_depth)
-                } else {
-                    0
-                }
+            let cur_number = if cur_depth < p.len() {
+                p.at(cur_depth)
             } else {
-                // if strategy is boundary- but q is END at this depth
-                // we then will have to use p path
-                if cur_depth < q.len() {
-                    q.at(cur_depth)
-                } else {
-                    (self.root_arity << cur_depth) - 1
-                }
+                0
             };
 
-            // If there is no node for current number we create it so we can the step into it
+            // If there is no node for current number we create it so we can then step into it
             if !cur_depth_nodes.contains_key(&cur_number) {
                 cur_depth_nodes.insert(
                     cur_number,
@@ -579,40 +577,20 @@ impl<V: Ord + Clone + Display, A: Actor + Display> LSeq<V, A> {
             new_prefix.push(*id);
 
             match atom {
-                Atom::Node { payload, children } if children.is_empty() => {
+                Atom::Node { payload, children } => {
+                    // Add current atom's value to the sequence before processing children
                     if let Some(v) = &payload.value {
                         seq.push((new_prefix.clone(), v.clone(), payload.clock.clone()));
                     }
-                }
-                Atom::Node { payload, children } => {
-                    // Add current atom's value to the sequence before/after processing children,
-                    // depending on the current level's strategy
-                    let children_strategy = self.strategies[new_prefix.len()];
-                    if children_strategy {
-                        if let Some(v) = &payload.value {
-                            seq.push((new_prefix.clone(), v.clone(), payload.clock.clone()));
-                        }
+                    if !children.is_empty() {
                         self.flatten_tree(&children, new_prefix, seq);
-                    } else {
-                        self.flatten_tree(&children, new_prefix.clone(), seq);
-                        if let Some(v) = &payload.value {
-                            seq.push((new_prefix.clone(), v.clone(), payload.clock.clone()));
-                        }
                     }
                 }
-                Atom::MajorNode { payload, children } if children.is_empty() => {
-                    self.flatten_atom_value(payload, new_prefix.clone(), seq);
-                }
                 Atom::MajorNode { payload, children } => {
-                    // Add mini nodes to the sequence before/after processing children,
-                    // depending on the current level's strategy
-                    let children_strategy = self.strategies[new_prefix.len()];
-                    if children_strategy {
-                        self.flatten_atom_value(payload, new_prefix.clone(), seq);
+                    // Add mini nodes to the sequence before processing children
+                    self.flatten_atom_value(payload, new_prefix.clone(), seq);
+                    if !children.is_empty() {
                         self.flatten_tree(&children, new_prefix, seq);
-                    } else {
-                        self.flatten_tree(&children, new_prefix.clone(), seq);
-                        self.flatten_atom_value(payload, new_prefix.clone(), seq);
                     }
                 }
             }
@@ -626,7 +604,7 @@ impl<V: Ord + Clone + Display, A: Actor + Display> LSeq<V, A> {
         prefix: Identifier,
         seq: &mut Vec<(Identifier, V, VClock<A>)>,
     ) {
-        // We return all miin-nodes here with the same Identifier,
+        // We return all mini-nodes here with the same Identifier,
         // this is ok for now as we don't support inserting between them.
         for (_, AtomPayload { clock, value }) in atom_value.iter() {
             if let Some(val) = value {
@@ -696,8 +674,8 @@ mod test {
 
         assert_eq!(*a_id, Identifier::new(&[1]));
         assert_eq!(*b_id, Identifier::new(&[2]));
-        assert_eq!(*c_id, Identifier::new(&[2, 1]));
-        assert_eq!(*d_id, Identifier::new(&[2, 2]));
+        assert_eq!(*c_id, Identifier::new(&[3]));
+        assert_eq!(*d_id, Identifier::new(&[3, 1]));
 
         assert_eq!(*a_val, 'A');
         assert_eq!(*b_val, 'B');
@@ -731,7 +709,7 @@ mod test {
         let (c_id, c_val, _) = &seq_values[1];
 
         assert_eq!(*a_id, Identifier::new(&[1]));
-        assert_eq!(*c_id, Identifier::new(&[2, 1]));
+        assert_eq!(*c_id, Identifier::new(&[3]));
 
         assert_eq!(*a_val, 'A');
         assert_eq!(*c_val, 'C');
@@ -826,16 +804,20 @@ mod test {
         // insert C to [A, B] (between B and END)
         insert_between_i_j(&mut lseq, Some(1), None, 'C', actor);
 
-        // insert D to [A, B, C] (between A and C)
-        insert_between_i_j(&mut lseq, Some(0), Some(2), 'D', actor);
+        // insert D to [A, B, C] (between C and END)
+        insert_between_i_j(&mut lseq, Some(2), None, 'D', actor);
+
+        // insert E to [A, B, C, D] (between B and D)
+        insert_between_i_j(&mut lseq, Some(1), Some(3), 'E', actor);
 
         // Test identifiers and values are in correct order in the sequence
         let seq_values = lseq.read().val;
-        assert_eq!(seq_values.len(), 4);
+        assert_eq!(seq_values.len(), 5);
         let (a_id, a_val, _) = &seq_values[0];
-        let (d_id, d_val, _) = &seq_values[1];
-        let (b_id, b_val, _) = &seq_values[2];
+        let (b_id, b_val, _) = &seq_values[1];
+        let (e_id, e_val, _) = &seq_values[2];
         let (c_id, c_val, _) = &seq_values[3];
+        let (d_id, d_val, _) = &seq_values[4];
         println!("FINAL SEQ: {:?}", seq_values);
 
         assert_eq!(*a_id, Identifier::new(&[1]));
@@ -843,10 +825,13 @@ mod test {
         assert_eq!(*a_val, 'A');
         assert_eq!(*b_val, 'B');
 
-        assert_eq!(*c_id, Identifier::new(&[2, 1]));
+        assert_eq!(*e_id, Identifier::new(&[2, 1]));
+        assert_eq!(*e_val, 'E');
+
+        assert_eq!(*c_id, Identifier::new(&[3]));
         assert_eq!(*c_val, 'C');
 
-        assert_eq!(*d_id, Identifier::new(&[1, 1]));
+        assert_eq!(*d_id, Identifier::new(&[3, 1]));
         assert_eq!(*d_val, 'D');
     }
 
@@ -915,13 +900,9 @@ mod test {
 
     #[test]
     fn test_insert_between_last_and_end() {
-        // in this test we try to insert between the very last Identifier and END (i.e. an append)
-        // in the scenario when there is no available slot between them and therefore a new level
-        // is created with some numbers == arity(some-level) - 1 in the Identifier,
-        // but ending with a number < arity(some-level) - 1, e.g.:
-        // if arity(level 0) == 4, and arity(level 1) == 8,
-        // then [3, 6]: where 3 == arity(level 0) - 1, and 6 < arity(level 1) - 1
-        let mut lseq = LSeq::<char, u64>::new(1, 4, LSeqStrategy::BoundaryMinus);
+        // in this test we try to insert between the very last Identifier possible
+        // at current tree's height, and END (i.e. an append)
+        let mut lseq = LSeq::<char, u64>::new(2, 4, LSeqStrategy::BoundaryPlus);
         let actor = 100;
 
         // Insert A to [] (between BEGIN and END)
@@ -933,20 +914,26 @@ mod test {
         // Insert C to [A, B] (between B and END)
         insert_between_i_j(&mut lseq, Some(1), None, 'C', actor);
 
+        // Insert D to [A, B, C] (between C and END)
+        insert_between_i_j(&mut lseq, Some(2), None, 'D', actor);
+
         // Test identifiers and values are in correct order in the sequence
         let seq_values = lseq.read().val;
         println!("FINAL SEQ: {:?}", seq_values);
-        assert_eq!(seq_values.len(), 3);
+        assert_eq!(seq_values.len(), 4);
         let (a_id, a_val, _) = &seq_values[0];
         let (b_id, b_val, _) = &seq_values[1];
         let (c_id, c_val, _) = &seq_values[2];
+        let (d_id, d_val, _) = &seq_values[3];
 
         assert_eq!(*a_id, Identifier::new(&[2]));
-        assert_eq!(*b_id, Identifier::new(&[3, 6]));
-        assert_eq!(*c_id, Identifier::new(&[3, 7, 14]));
+        assert_eq!(*b_id, Identifier::new(&[3]));
+        assert_eq!(*c_id, Identifier::new(&[3, 2]));
+        assert_eq!(*d_id, Identifier::new(&[3, 4]));
         assert_eq!(*a_val, 'A');
         assert_eq!(*b_val, 'B');
         assert_eq!(*c_val, 'C');
+        assert_eq!(*d_val, 'D');
     }
 
     #[test]
@@ -1061,8 +1048,8 @@ mod test {
         assert_eq!(*b_id, Identifier::new(&[1]));
         assert_eq!(*e_id, Identifier::new(&[1, 2]));
         assert_eq!(*c_id, Identifier::new(&[1, 3]));
-        assert_eq!(*d_id, Identifier::new(&[1, 5]));
-        assert_eq!(*f_id, Identifier::new(&[1, 6]));
+        assert_eq!(*d_id, Identifier::new(&[1, 6]));
+        assert_eq!(*f_id, Identifier::new(&[1, 7]));
         assert_eq!(*a_id, Identifier::new(&[2]));
         assert_eq!(*b_val, 'B');
         assert_eq!(*e_val, 'E');
